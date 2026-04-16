@@ -7,7 +7,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libgles2 \
     libegl1 \
-    libgles2-mesa \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
