@@ -5,6 +5,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
+    libgles2 \
+    libegl1 \
+    libgles2-mesa \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
