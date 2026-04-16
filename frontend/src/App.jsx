@@ -6,8 +6,9 @@ const WS_URL   = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 const PING_URL = WS_URL.replace(/^wss?/, 'http').replace(/^wss/, 'https').replace('/ws', '/health')
 const MODES    = ['particles', 'music', 'drawing', 'strange']
 const BACKEND_THROTTLE_MS = 80
-const HISTORY_LEN = 6      // frames for majority-vote smoothing
-const CLEAR_DELAY = 12     // frames with no hand before clearing UI
+const BUFFER_SIZE  = 4     // collect N frames then majority vote
+const UPDATE_MS    = 1000  // push to UI at most once per second
+const CLEAR_DELAY  = 20    // frames with no hand before clearing
 
 export default function App() {
   const videoRef    = useRef(null)
@@ -19,10 +20,10 @@ export default function App() {
   const mpRef       = useRef(null)
   const overlayImg  = useRef(null)
 
-  // Smoothing state (refs, not state — no re-renders)
-  const fingerHist    = useRef([[], []])   // per-hand rolling history
-  const noHandFrames  = useRef(0)          // countdown before clearing panel
-  const lastHandData  = useRef([])         // last committed hand state
+  // Detection buffer: collect 4 frames, majority vote, update UI every 1s
+  const frameBuffer   = useRef([[], []])  // [hand0_finger_counts[], hand1_finger_counts[]]
+  const lastUpdateMs  = useRef(0)         // last time we pushed to setHandData
+  const noHandFrames  = useRef(0)
 
   const [mode, setMode]             = useState('particles')
   const [connected, setConnected]   = useState(false)
@@ -120,15 +121,7 @@ export default function App() {
     } catch (err) { setError(`Camera denied: ${err.message}`) }
   }, [])
 
-  // ── Majority vote finger smoother ──────────────────────────────────────────
-  const smoothFingers = (slotIdx, raw) => {
-    const hist = fingerHist.current[slotIdx]
-    hist.push(raw)
-    if (hist.length > HISTORY_LEN) hist.shift()
-    const freq = {}
-    hist.forEach(v => { freq[v] = (freq[v] || 0) + 1 })
-    return parseInt(Object.entries(freq).sort((a,b) => b[1]-a[1])[0][0])
-  }
+  // ── Buffer + 1s update ────────────────────────────────────────────────────
 
   // ── Main render loop ───────────────────────────────────────────────────────
   const loop = useCallback(() => {
@@ -166,43 +159,51 @@ export default function App() {
         const result = mp.detectForVideo(video, performance.now())
 
         if (result.handLandmarks?.length > 0) {
-          noHandFrames.current = 0   // reset clear countdown
+          noHandFrames.current = 0
 
-          // Draw mirrored landmarks
+          // Draw mirrored landmarks immediately (every frame, no throttle)
           drawLandmarksMirrored(ctx, result.handLandmarks, w, h)
 
-          // Build smoothed hand data
-          const hands = result.handedness.map((hn, i) => {
-            const raw      = countFingers(result.handLandmarks[i], hn[0].displayName)
-            const smoothed = smoothFingers(i, raw)
-            return {
-              handedness:     hn[0].displayName,
-              fingers:        smoothed,
-              gesture:        recognizeGesture(smoothed),
-              special_gesture: detectSpecial(result.handLandmarks[i]),
-              center:         getCenter(result.handLandmarks[i], w, h),
-            }
+          // Collect raw finger counts into per-hand buffers
+          result.handedness.forEach((hn, i) => {
+            const raw = countFingers(result.handLandmarks[i], hn[0].displayName)
+            const buf = frameBuffer.current[i]
+            buf.push(raw)
+            if (buf.length > BUFFER_SIZE) buf.shift()
           })
+          // Clear unused hand slots
+          for (let i = result.handedness.length; i < 2; i++) {
+            frameBuffer.current[i] = []
+          }
 
-          // Clear history for any unused hand slots
-          for (let i = hands.length; i < 2; i++) fingerHist.current[i] = []
+          // Push to UI at most once per UPDATE_MS
+          if (now - lastUpdateMs.current >= UPDATE_MS) {
+            lastUpdateMs.current = now
 
-          // Only update state if fingers or hand count actually changed
-          const prev = lastHandData.current
-          const changed = hands.length !== prev.length ||
-            hands.some((h, i) => h.fingers !== prev[i]?.fingers ||
-                                  h.handedness !== prev[i]?.handedness)
-          if (changed) {
-            lastHandData.current = hands
+            const hands = result.handedness.map((hn, i) => {
+              const buf = frameBuffer.current[i]
+              // Majority vote over collected frames
+              const freq = {}
+              buf.forEach(v => { freq[v] = (freq[v] || 0) + 1 })
+              const smoothed = buf.length === 0 ? 0
+                : parseInt(Object.entries(freq).sort((a,b) => b[1]-a[1])[0][0])
+              return {
+                handedness:      hn[0].displayName,
+                fingers:         smoothed,
+                gesture:         recognizeGesture(smoothed),
+                special_gesture: detectSpecial(result.handLandmarks[i]),
+                center:          getCenter(result.handLandmarks[i], w, h),
+              }
+            })
             setHandData([...hands])
           }
 
         } else {
           // Hands disappeared — wait CLEAR_DELAY frames before wiping panel
           noHandFrames.current++
-          if (noHandFrames.current >= CLEAR_DELAY && lastHandData.current.length > 0) {
-            fingerHist.current = [[], []]
-            lastHandData.current = []
+          if (noHandFrames.current >= CLEAR_DELAY) {
+            frameBuffer.current = [[], []]
+            lastUpdateMs.current = 0
             setHandData([])
           }
         }
