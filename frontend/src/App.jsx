@@ -6,29 +6,46 @@ import ModeSelector from './components/ModeSelector.jsx'
 const WS_URL   = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 const PING_URL = WS_URL.replace(/^wss?/, 'http').replace(/^wss/, 'https').replace('/ws', '/health')
 const MODES    = ['particles', 'music', 'drawing', 'strange']
-const BACKEND_THROTTLE_MS = 80   // send to backend ~12x/sec for effects
+const BACKEND_THROTTLE_MS = 80
+
+// Stabilize hand data — only update UI if state held for N consecutive frames
+const STABLE_FRAMES_REQUIRED = 4
 
 export default function App() {
-  const videoRef    = useRef(null)
-  const canvasRef   = useRef(null)   // main display canvas
-  const wsRef       = useRef(null)
-  const animRef     = useRef(null)
-  const lastSendRef = useRef(0)
-  const pingRef     = useRef(null)
-  const mpRef       = useRef(null)
-  const overlayImg  = useRef(null)   // latest effect overlay from backend
+  const videoRef      = useRef(null)
+  const canvasRef     = useRef(null)
+  const wsRef         = useRef(null)
+  const animRef       = useRef(null)
+  const lastSendRef   = useRef(0)
+  const pingRef       = useRef(null)
+  const mpRef         = useRef(null)
+  const overlayImg    = useRef(null)
 
-  const [mode, setMode]               = useState('particles')
-  const [connected, setConnected]     = useState(false)
-  const [handData, setHandData]       = useState([])
-  const [localFps, setLocalFps]       = useState(0)
+  // Stabilization buffers
+  const handBuffer    = useRef([])   // last N raw detections
+  const stableHands   = useRef([])   // last committed stable state
+
+  const [mode, setMode]             = useState('particles')
+  const [connected, setConnected]   = useState(false)
+  const [handData, setHandData]     = useState([])
+  const [localFps, setLocalFps]     = useState(0)
   const [streamActive, setStreamActive] = useState(false)
-  const [error, setError]             = useState(null)
-  const [mpReady, setMpReady]         = useState(false)
-  const [waking, setWaking]           = useState(false)
+  const [error, setError]           = useState(null)
+  const [mpReady, setMpReady]       = useState(false)
+  const [waking, setWaking]         = useState(false)
+  const [isMobile, setIsMobile]     = useState(false)
+  const [showPanel, setShowPanel]   = useState(false) // mobile panel toggle
 
   const localFrameCount = useRef(0)
   const localFpsTimer   = useRef(Date.now())
+
+  // ── Detect mobile ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    const check = () => setIsMobile(window.innerWidth < 768)
+    check()
+    window.addEventListener('resize', check)
+    return () => window.removeEventListener('resize', check)
+  }, [])
 
   // ── Load MediaPipe JS ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -48,14 +65,14 @@ export default function App() {
           },
           runningMode: 'VIDEO',
           numHands: 2,
-          minHandDetectionConfidence: 0.5,
-          minHandPresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5,
+          minHandDetectionConfidence: 0.6,
+          minHandPresenceConfidence: 0.6,
+          minTrackingConfidence: 0.6,
         })
         mpRef.current = detector
         setMpReady(true)
       } catch (e) {
-        console.warn('MediaPipe JS unavailable, using backend detection:', e)
+        console.warn('MediaPipe JS unavailable:', e)
       }
     }
     load()
@@ -82,14 +99,9 @@ export default function App() {
       try {
         const data = JSON.parse(evt.data)
         if (data.type === 'effect_overlay') {
-          // Load overlay PNG into an Image object for compositing
           const img = new Image()
           img.onload = () => { overlayImg.current = img }
           img.src = data.overlay
-          setHandData(data.hands || [])
-        } else if (data.type === 'frame_result') {
-          // Legacy fallback
-          setHandData(data.hands || [])
         }
       } catch {}
     }
@@ -110,6 +122,38 @@ export default function App() {
     } catch (err) { setError(`Camera denied: ${err.message}`) }
   }, [])
 
+  // ── Stabilize hand detections ─────────────────────────────────────────────
+  const pushHandBuffer = useCallback((rawHands) => {
+    const buf = handBuffer.current
+    buf.push(rawHands)
+    if (buf.length > STABLE_FRAMES_REQUIRED) buf.shift()
+
+    // Only update UI if last N frames all agree on hand count
+    if (buf.length < STABLE_FRAMES_REQUIRED) return
+    const counts = buf.map(h => h.length)
+    const allSame = counts.every(c => c === counts[0])
+    if (!allSame) return  // still flickering — don't update
+
+    // Also stabilize finger counts per hand
+    const stable = rawHands.map((hand, i) => {
+      const fingerCounts = buf.map(b => b[i]?.fingers ?? -1).filter(f => f >= 0)
+      const majority = fingerCounts.sort((a,b) =>
+        fingerCounts.filter(v=>v===b).length - fingerCounts.filter(v=>v===a).length
+      )[0]
+      return { ...hand, fingers: majority ?? hand.fingers,
+               gesture: recognizeGesture(majority ?? hand.fingers) }
+    })
+
+    // Only trigger re-render if something actually changed
+    const prev = stableHands.current
+    const changed = stable.length !== prev.length ||
+      stable.some((h,i) => h.fingers !== prev[i]?.fingers || h.handedness !== prev[i]?.handedness)
+    if (changed) {
+      stableHands.current = stable
+      setHandData(stable)
+    }
+  }, [])
+
   // ── Main render loop ──────────────────────────────────────────────────────
   const loop = useCallback(() => {
     const video  = videoRef.current
@@ -119,7 +163,7 @@ export default function App() {
       return
     }
 
-    // FPS counter
+    // FPS
     localFrameCount.current++
     const now = Date.now()
     if (now - localFpsTimer.current >= 1000) {
@@ -128,60 +172,51 @@ export default function App() {
       localFpsTimer.current = now
     }
 
-    const w = video.videoWidth
-    const h = video.videoHeight
-    canvas.width  = w
-    canvas.height = h
+    const w = video.videoWidth, h = video.videoHeight
+    canvas.width = w; canvas.height = h
     const ctx = canvas.getContext('2d')
-
-    // 1. Draw raw video
     ctx.drawImage(video, 0, 0)
 
-    // 2. Run local MediaPipe and draw landmarks
+    // Local MP detection
     const mp = mpRef.current
     if (mp) {
       try {
         const result = mp.detectForVideo(video, performance.now())
         if (result.handLandmarks?.length > 0) {
           drawLandmarks(ctx, result.handLandmarks, w, h)
-          const hands = result.handedness.map((hn, i) => {
+          const raw = result.handedness.map((hn, i) => {
             const fingers = countFingers(result.handLandmarks[i], hn[0].displayName)
             return {
-              handedness: hn[0].displayName,
-              fingers,
+              handedness: hn[0].displayName, fingers,
               gesture: recognizeGesture(fingers),
               special_gesture: null,
               center: getCenter(result.handLandmarks[i], w, h),
             }
           })
-          setHandData(hands)
+          pushHandBuffer(raw)
         } else {
-          setHandData([])
+          pushHandBuffer([])
         }
       } catch {}
     }
 
-    // 3. Composite effect overlay from backend on top
+    // Composite effect overlay
     if (overlayImg.current) {
       ctx.drawImage(overlayImg.current, 0, 0, w, h)
     }
 
-    // 4. Send frame to backend for effects (throttled)
+    // Throttled backend send
     const ws = wsRef.current
     if (ws?.readyState === WebSocket.OPEN && now - lastSendRef.current >= BACKEND_THROTTLE_MS) {
       lastSendRef.current = now
       const tmp = document.createElement('canvas')
       tmp.width = w; tmp.height = h
       tmp.getContext('2d').drawImage(video, 0, 0)
-      ws.send(JSON.stringify({
-        type: 'frame',
-        frame: tmp.toDataURL('image/jpeg', 0.5),
-        mode,
-      }))
+      ws.send(JSON.stringify({ type: 'frame', frame: tmp.toDataURL('image/jpeg', 0.5), mode }))
     }
 
     animRef.current = requestAnimationFrame(loop)
-  }, [mode])
+  }, [mode, pushHandBuffer])
 
   useEffect(() => { connectWS(); startCamera() }, [])
 
@@ -195,10 +230,83 @@ export default function App() {
     overlayImg.current = null
     if (wsRef.current?.readyState === WebSocket.OPEN)
       wsRef.current.send(JSON.stringify({ type: 'clear' }))
+    if (isMobile) setShowPanel(false)
   }
 
   const modeColor = { particles:'#a78bfa', music:'#34d399', drawing:'#f472b6', strange:'#fbbf24' }[mode]
+  const modeName  = { particles:'✦ Particles', music:'♫ Music', drawing:'✏ Drawing', strange:'⬡ Strange' }[mode]
 
+  // ── MOBILE LAYOUT ─────────────────────────────────────────────────────────
+  if (isMobile) {
+    return (
+      <div style={m.app}>
+        {/* Header */}
+        <div style={{ ...m.header, borderBottomColor: `${modeColor}55` }}>
+          <span style={{ ...m.title, color: modeColor }}>HAND GESTURE</span>
+          <div style={m.headerRight}>
+            <span style={{ ...m.dot,
+              background: connected ? '#00ff88' : '#ff3344',
+              boxShadow: connected ? '0 0 6px #00ff88' : '0 0 6px #ff3344' }} />
+            {localFps > 0 && (
+              <span style={{ ...m.fpsBadge, borderColor: modeColor, color: modeColor }}>
+                {localFps} FPS
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Full-screen camera */}
+        <div style={m.cameraWrap}>
+          <canvas ref={canvasRef} style={m.canvas} />
+          {!streamActive && (
+            <div style={m.camPlaceholder}>
+              <div style={m.camIcon}>◉</div>
+              <div style={m.camText}>Starting camera…</div>
+            </div>
+          )}
+          {/* Inline gesture badge */}
+          {handData.length > 0 && (
+            <div style={m.gestureBadge}>
+              {handData.map((h,i) => (
+                <span key={i} style={{ ...m.gestureChip, borderColor: modeColor, color: modeColor }}>
+                  {h.special_gesture || h.gesture} · {h.fingers}✋
+                </span>
+              ))}
+            </div>
+          )}
+          {/* Corner decorations */}
+          <div style={{ ...m.corner, top:8, left:8,   borderTop:`2px solid ${modeColor}`, borderLeft:`2px solid ${modeColor}` }} />
+          <div style={{ ...m.corner, top:8, right:8,  borderTop:`2px solid ${modeColor}`, borderRight:`2px solid ${modeColor}` }} />
+          <div style={{ ...m.corner, bottom:72, left:8,  borderBottom:`2px solid ${modeColor}`, borderLeft:`2px solid ${modeColor}` }} />
+          <div style={{ ...m.corner, bottom:72, right:8, borderBottom:`2px solid ${modeColor}`, borderRight:`2px solid ${modeColor}` }} />
+        </div>
+
+        {/* Bottom bar: mode switcher */}
+        <div style={{ ...m.bottomBar, borderTopColor: `${modeColor}44` }}>
+          {MODES.map(md => {
+            const active = md === mode
+            const mc = { particles:'#a78bfa', music:'#34d399', drawing:'#f472b6', strange:'#fbbf24' }[md]
+            const icons = { particles:'✦', music:'♫', drawing:'✏', strange:'⬡' }
+            return (
+              <button key={md} onClick={() => handleModeChange(md)} style={{
+                ...m.modeBtn,
+                color: active ? mc : '#444',
+                borderTop: active ? `2px solid ${mc}` : '2px solid transparent',
+                background: active ? `${mc}15` : 'transparent',
+              }}>
+                <span style={m.modeBtnIcon}>{icons[md]}</span>
+                <span style={m.modeBtnLabel}>{md.toUpperCase()}</span>
+              </button>
+            )
+          })}
+        </div>
+
+        <video ref={videoRef} style={{ display:'none' }} muted playsInline />
+      </div>
+    )
+  }
+
+  // ── DESKTOP LAYOUT ────────────────────────────────────────────────────────
   return (
     <div style={s.app}>
       <div style={{ ...s.header, borderBottomColor: `${modeColor}55` }}>
@@ -223,7 +331,20 @@ export default function App() {
       </div>
 
       <div style={s.body}>
-        <VideoCanvas canvasRef={canvasRef} streamActive={streamActive} />
+        <div style={s.cameraWrap}>
+          <canvas ref={canvasRef} style={s.canvas} />
+          {!streamActive && (
+            <div style={s.placeholder}>
+              <div style={s.placeholderIcon}>◉</div>
+              <div style={s.placeholderText}>Starting camera…</div>
+            </div>
+          )}
+          <div style={{ ...s.corner, top:8, left:8,   borderTop:'2px solid #00e5ff', borderLeft:'2px solid #00e5ff' }} />
+          <div style={{ ...s.corner, top:8, right:8,  borderTop:'2px solid #00e5ff', borderRight:'2px solid #00e5ff' }} />
+          <div style={{ ...s.corner, bottom:8, left:8,  borderBottom:'2px solid #00e5ff', borderLeft:'2px solid #00e5ff' }} />
+          <div style={{ ...s.corner, bottom:8, right:8, borderBottom:'2px solid #00e5ff', borderRight:'2px solid #00e5ff' }} />
+        </div>
+
         <div style={s.panel}>
           <ModeSelector modes={MODES} current={mode} onChange={handleModeChange} />
           <div style={{ ...s.divider, borderColor: `${modeColor}33` }} />
@@ -246,7 +367,7 @@ export default function App() {
   )
 }
 
-// ── MediaPipe JS helpers ──────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function countFingers(lm, handedness) {
   if (!lm || lm.length < 21) return 0
@@ -275,8 +396,7 @@ function drawLandmarks(ctx, allLandmarks, w, h) {
   ]
   for (const lm of allLandmarks) {
     const pts = lm.map(l => [l.x*w, l.y*h])
-    ctx.strokeStyle = '#00c864'
-    ctx.lineWidth = 2
+    ctx.strokeStyle = '#00c864'; ctx.lineWidth = 2
     for (const [a,b] of connections) {
       ctx.beginPath(); ctx.moveTo(...pts[a]); ctx.lineTo(...pts[b]); ctx.stroke()
     }
@@ -288,6 +408,7 @@ function drawLandmarks(ctx, allLandmarks, w, h) {
   }
 }
 
+// ── Desktop styles ────────────────────────────────────────────────────────────
 const s = {
   app: { height:'100vh', display:'flex', flexDirection:'column', background:'#0a0a0f',
          color:'#e0e0e0', fontFamily:"'Courier New', monospace", overflow:'hidden' },
@@ -303,6 +424,13 @@ const s = {
   wakingBadge: { fontSize:'10px', letterSpacing:'2px', color:'#fbbf24',
                  border:'1px solid #fbbf2444', borderRadius:'4px', padding:'2px 8px' },
   body: { flex:1, display:'flex', overflow:'hidden' },
+  cameraWrap: { flex:1, position:'relative', background:'#050508',
+                display:'flex', alignItems:'center', justifyContent:'center', overflow:'hidden' },
+  canvas: { width:'100%', height:'100%', objectFit:'contain' },
+  placeholder: { position:'absolute', display:'flex', flexDirection:'column', alignItems:'center', gap:'16px' },
+  placeholderIcon: { fontSize:'48px', color:'#1a1a2e' },
+  placeholderText: { fontSize:'12px', letterSpacing:'3px', color:'#2a2a3e' },
+  corner: { position:'absolute', width:20, height:20, opacity:0.6 },
   panel: { width:'320px', minWidth:'320px', background:'#0d0d1a', borderLeft:'1px solid #1a1a2e',
            display:'flex', flexDirection:'column', padding:'20px 16px', gap:'16px', overflowY:'auto' },
   divider: { borderTop:'1px solid', margin:'0 -4px' },
@@ -312,4 +440,37 @@ const s = {
              padding:'10px 12px', background:'#12121e', borderRadius:'8px', border:'1px solid #1e1e32' },
   hintDot: { width:6, height:6, borderRadius:'50%', flexShrink:0 },
   hintText: { fontSize:'11px', color:'#555', letterSpacing:'0.5px' },
+}
+
+// ── Mobile styles ─────────────────────────────────────────────────────────────
+const m = {
+  app: { height:'100dvh', display:'flex', flexDirection:'column', background:'#0a0a0f',
+         color:'#e0e0e0', fontFamily:"'Courier New', monospace", overflow:'hidden' },
+  header: { display:'flex', alignItems:'center', justifyContent:'space-between',
+            padding:'8px 16px', background:'#0d0d1a', borderBottom:'1px solid', flexShrink:0 },
+  title: { fontSize:'13px', letterSpacing:'3px', fontWeight:700 },
+  headerRight: { display:'flex', alignItems:'center', gap:'8px' },
+  dot: { width:8, height:8, borderRadius:'50%', flexShrink:0 },
+  fpsBadge: { fontSize:'10px', border:'1px solid', borderRadius:'4px', padding:'2px 6px' },
+  cameraWrap: { flex:1, position:'relative', background:'#050508', overflow:'hidden' },
+  canvas: { width:'100%', height:'100%', objectFit:'cover' },
+  camPlaceholder: { position:'absolute', inset:0, display:'flex', flexDirection:'column',
+                    alignItems:'center', justifyContent:'center', gap:'12px' },
+  camIcon: { fontSize:'40px', color:'#1a1a2e' },
+  camText: { fontSize:'11px', letterSpacing:'3px', color:'#2a2a3e' },
+  gestureBadge: { position:'absolute', top:12, left:'50%', transform:'translateX(-50%)',
+                  display:'flex', gap:'8px', flexWrap:'wrap', justifyContent:'center' },
+  gestureChip: { fontSize:'12px', letterSpacing:'1px', fontWeight:700,
+                 background:'#0d0d1acc', border:'1px solid', borderRadius:'20px',
+                 padding:'4px 14px', backdropFilter:'blur(8px)',
+                 fontFamily:"'Courier New', monospace" },
+  corner: { position:'absolute', width:16, height:16, opacity:0.7 },
+  bottomBar: { display:'flex', background:'#0d0d1a', borderTop:'1px solid',
+               flexShrink:0, paddingBottom:'env(safe-area-inset-bottom)' },
+  modeBtn: { flex:1, display:'flex', flexDirection:'column', alignItems:'center',
+             justifyContent:'center', gap:'3px', padding:'10px 4px',
+             cursor:'pointer', transition:'all 0.2s',
+             fontFamily:"'Courier New', monospace" },
+  modeBtnIcon: { fontSize:'16px' },
+  modeBtnLabel: { fontSize:'8px', letterSpacing:'1px', fontWeight:700 },
 }
