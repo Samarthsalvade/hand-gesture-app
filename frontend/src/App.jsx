@@ -3,7 +3,7 @@ import GesturePanel from './components/GesturePanel.jsx'
 import ModeSelector from './components/ModeSelector.jsx'
 
 const WS_URL   = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
-const PING_URL = WS_URL.replace(/^wss?/, 'http').replace(/^wss/, 'https').replace('/ws', '/health')
+const PING_URL = WS_URL.replace(/^ws:/, 'http:').replace(/^wss:/, 'https:').replace('/ws', '/health')
 const MODES    = ['particles', 'music', 'drawing', 'strange']
 const BACKEND_THROTTLE_MS = 80
 
@@ -190,9 +190,10 @@ export default function App() {
   useEffect(() => { connectWS(); startCamera() }, [])
 
   useEffect(() => {
-    if (streamActive) animRef.current = requestAnimationFrame(loop)
+    // Start loop immediately — it checks video.readyState internally
+    animRef.current = requestAnimationFrame(loop)
     return () => cancelAnimationFrame(animRef.current)
-  }, [streamActive, loop])
+  }, [loop])
 
   const handleModeChange = (m) => {
     setMode(m)
