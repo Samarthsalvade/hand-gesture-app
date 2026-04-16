@@ -13,7 +13,6 @@ from gesture_processor import GestureProcessor
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Shared processor (loaded once at startup) ─────────────────────────────
 processor: GestureProcessor = None
 
 
@@ -21,7 +20,7 @@ processor: GestureProcessor = None
 async def lifespan(app: FastAPI):
     global processor
     logger.info("Starting up — loading GestureProcessor…")
-    processor = GestureProcessor()   # downloads model here if needed
+    processor = GestureProcessor()
     logger.info("GestureProcessor ready.")
     yield
     logger.info("Shutting down.")
@@ -40,8 +39,6 @@ app.add_middleware(
 )
 
 
-# ── HTTP endpoints ─────────────────────────────────────────────────────────
-
 @app.get("/")
 async def root():
     return {"status": "Hand Gesture API running", "ts": time.time()}
@@ -49,11 +46,8 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Keep-alive endpoint pinged every 25 s by the frontend."""
     return {"status": "ok", "ts": time.time()}
 
-
-# ── WebSocket ──────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -71,25 +65,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not frame_data:
                     continue
 
-                # Decode base64 → numpy frame
                 img_bytes = base64.b64decode(frame_data.split(",")[-1])
                 nparr     = np.frombuffer(img_bytes, np.uint8)
                 frame     = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if frame is None:
                     continue
 
-                result = processor.process_frame(frame, mode)
+                # Get transparent RGBA overlay + hand data
+                overlay, hands, fps = processor.render_effects(frame, mode)
 
-                _, buf = cv2.imencode(".jpg", result["frame"],
-                                     [cv2.IMWRITE_JPEG_QUALITY, 75])
+                # Encode as PNG to preserve alpha channel
+                _, buf = cv2.imencode(".png", overlay)
                 b64 = base64.b64encode(buf).decode()
 
                 await websocket.send_text(json.dumps({
-                    "type":  "frame_result",
-                    "frame": f"data:image/jpeg;base64,{b64}",
-                    "hands": result["hands"],
-                    "fps":   result["fps"],
-                    "mode":  mode,
+                    "type":    "effect_overlay",
+                    "overlay": f"data:image/png;base64,{b64}",
+                    "hands":   hands,
+                    "fps":     fps,
+                    "mode":    mode,
                 }))
 
             elif mtype == "clear":
