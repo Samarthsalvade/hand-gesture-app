@@ -1,11 +1,8 @@
-[phases.setup]
-nixPkgs = ["python312", "libGL", "glib"]
-
 [phases.install]
 cmds = [
-  "pip install --upgrade pip",
-  "pip uninstall -y opencv-python opencv-contrib-python || true",
-  "pip install -r requirements.txt"
+  "/opt/venv/bin/pip install --upgrade pip",
+  "/opt/venv/bin/pip uninstall -y opencv-python opencv-contrib-python || true",
+  "/opt/venv/bin/pip install -r requirements.txt"
 ]
 
 [start]
