@@ -6,9 +6,6 @@ const WS_URL   = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws'
 const PING_URL = WS_URL.replace(/^wss?/, 'http').replace(/^wss/, 'https').replace('/ws', '/health')
 const MODES    = ['particles', 'music', 'drawing', 'strange']
 const BACKEND_THROTTLE_MS = 80
-const BUFFER_SIZE  = 4     // collect N frames then majority vote
-const UPDATE_MS    = 1000  // push to UI at most once per second
-const CLEAR_DELAY  = 20    // frames with no hand before clearing
 
 export default function App() {
   const videoRef    = useRef(null)
@@ -19,11 +16,6 @@ export default function App() {
   const pingRef     = useRef(null)
   const mpRef       = useRef(null)
   const overlayImg  = useRef(null)
-
-  // Detection buffer: collect 4 frames, majority vote, update UI every 1s
-  const frameBuffer   = useRef([[], []])  // [hand0_finger_counts[], hand1_finger_counts[]]
-  const lastUpdateMs  = useRef(0)         // last time we pushed to setHandData
-  const noHandFrames  = useRef(0)
 
   const [mode, setMode]             = useState('particles')
   const [connected, setConnected]   = useState(false)
@@ -121,8 +113,6 @@ export default function App() {
     } catch (err) { setError(`Camera denied: ${err.message}`) }
   }, [])
 
-  // ── Buffer + 1s update ────────────────────────────────────────────────────
-
   // ── Main render loop ───────────────────────────────────────────────────────
   const loop = useCallback(() => {
     const video  = videoRef.current
@@ -132,7 +122,6 @@ export default function App() {
       return
     }
 
-    // FPS
     fpsCount.current++
     const now = Date.now()
     if (now - fpsTimer.current >= 1000) {
@@ -145,72 +134,38 @@ export default function App() {
     canvas.width = w; canvas.height = h
     const ctx = canvas.getContext('2d')
 
-    // ── Mirror flip ──────────────────────────────────────────────────────────
+    // Mirror flip
     ctx.save()
     ctx.translate(w, 0)
     ctx.scale(-1, 1)
     ctx.drawImage(video, 0, 0)
     ctx.restore()
 
-    // ── MediaPipe detection ──────────────────────────────────────────────────
+    // MediaPipe detection — update handData every frame, no smoothing
     const mp = mpRef.current
     if (mp) {
       try {
         const result = mp.detectForVideo(video, performance.now())
-
         if (result.handLandmarks?.length > 0) {
-          noHandFrames.current = 0
-
-          // Draw mirrored landmarks immediately (every frame, no throttle)
           drawLandmarksMirrored(ctx, result.handLandmarks, w, h)
-
-          // Collect raw finger counts into per-hand buffers
-          result.handedness.forEach((hn, i) => {
-            const raw = countFingers(result.handLandmarks[i], hn[0].displayName)
-            const buf = frameBuffer.current[i]
-            buf.push(raw)
-            if (buf.length > BUFFER_SIZE) buf.shift()
+          const hands = result.handedness.map((hn, i) => {
+            const fingers = countFingers(result.handLandmarks[i], hn[0].displayName)
+            return {
+              handedness:      hn[0].displayName,
+              fingers,
+              gesture:         recognizeGesture(fingers),
+              special_gesture: detectSpecial(result.handLandmarks[i]),
+              center:          getCenter(result.handLandmarks[i], w, h),
+            }
           })
-          // Clear unused hand slots
-          for (let i = result.handedness.length; i < 2; i++) {
-            frameBuffer.current[i] = []
-          }
-
-          // Push to UI at most once per UPDATE_MS
-          if (now - lastUpdateMs.current >= UPDATE_MS) {
-            lastUpdateMs.current = now
-
-            const hands = result.handedness.map((hn, i) => {
-              const buf = frameBuffer.current[i]
-              // Majority vote over collected frames
-              const freq = {}
-              buf.forEach(v => { freq[v] = (freq[v] || 0) + 1 })
-              const smoothed = buf.length === 0 ? 0
-                : parseInt(Object.entries(freq).sort((a,b) => b[1]-a[1])[0][0])
-              return {
-                handedness:      hn[0].displayName,
-                fingers:         smoothed,
-                gesture:         recognizeGesture(smoothed),
-                special_gesture: detectSpecial(result.handLandmarks[i]),
-                center:          getCenter(result.handLandmarks[i], w, h),
-              }
-            })
-            setHandData([...hands])
-          }
-
+          setHandData(hands)
         } else {
-          // Hands disappeared — wait CLEAR_DELAY frames before wiping panel
-          noHandFrames.current++
-          if (noHandFrames.current >= CLEAR_DELAY) {
-            frameBuffer.current = [[], []]
-            lastUpdateMs.current = 0
-            setHandData([])
-          }
+          setHandData([])
         }
       } catch {}
     }
 
-    // ── Composite effect overlay from backend ────────────────────────────────
+    // Composite effect overlay
     if (overlayImg.current) {
       ctx.save()
       ctx.translate(w, 0)
@@ -219,13 +174,12 @@ export default function App() {
       ctx.restore()
     }
 
-    // ── Send to backend (throttled) ──────────────────────────────────────────
+    // Send to backend (throttled)
     const ws = wsRef.current
     if (ws?.readyState === WebSocket.OPEN && now - lastSendRef.current >= BACKEND_THROTTLE_MS) {
       lastSendRef.current = now
       const tmp = document.createElement('canvas')
       tmp.width = w; tmp.height = h
-      // Send un-mirrored to backend (it expects normal orientation)
       tmp.getContext('2d').drawImage(video, 0, 0)
       ws.send(JSON.stringify({ type: 'frame', frame: tmp.toDataURL('image/jpeg', 0.5), mode }))
     }
@@ -249,7 +203,7 @@ export default function App() {
 
   const modeColor = { particles:'#a78bfa', music:'#34d399', drawing:'#f472b6', strange:'#fbbf24' }[mode]
 
-  // ── MOBILE LAYOUT ─────────────────────────────────────────────────────────
+  // ── MOBILE LAYOUT ──────────────────────────────────────────────────────────
   if (isMobile) {
     return (
       <div style={mob.app}>
@@ -257,8 +211,7 @@ export default function App() {
           <span style={{ ...mob.title, color: modeColor }}>HAND GESTURE</span>
           <div style={mob.headerRight}>
             {waking && <span style={mob.waking}>WAKING…</span>}
-            <span style={{ ...mob.dot,
-              background: connected ? '#00ff88' : '#ff3344',
+            <span style={{ ...mob.dot, background: connected ? '#00ff88' : '#ff3344',
               boxShadow: connected ? '0 0 6px #00ff88' : '0 0 6px #ff3344' }} />
             {localFps > 0 && (
               <span style={{ ...mob.fps, borderColor: modeColor, color: modeColor }}>
@@ -268,7 +221,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Full-screen camera */}
         <div style={mob.cameraWrap}>
           <canvas ref={canvasRef} style={mob.canvas} />
           {!streamActive && (
@@ -277,8 +229,6 @@ export default function App() {
               <div style={{ fontSize:'11px', letterSpacing:'3px', color:'#2a2a3e' }}>Starting camera…</div>
             </div>
           )}
-
-          {/* Gesture badge overlay */}
           {handData.length > 0 && (
             <div style={mob.badgeRow}>
               {handData.map((h, i) => (
@@ -301,8 +251,6 @@ export default function App() {
               ))}
             </div>
           )}
-
-          {/* Corner decorations */}
           {[{top:8,left:8,borderTop:`2px solid ${modeColor}`,borderLeft:`2px solid ${modeColor}`},
             {top:8,right:8,borderTop:`2px solid ${modeColor}`,borderRight:`2px solid ${modeColor}`},
             {bottom:72,left:8,borderBottom:`2px solid ${modeColor}`,borderLeft:`2px solid ${modeColor}`},
@@ -312,7 +260,6 @@ export default function App() {
           ))}
         </div>
 
-        {/* Bottom tab bar */}
         <div style={{ ...mob.tabBar, borderTopColor: `${modeColor}44` }}>
           {MODES.map(md => {
             const active = md === mode
@@ -352,8 +299,7 @@ export default function App() {
         </div>
         <div style={desk.statusRow}>
           {waking && <span style={desk.wakingBadge}>WAKING…</span>}
-          <span style={{ ...desk.dot,
-            background: connected ? '#00ff88' : '#ff3344',
+          <span style={{ ...desk.dot, background: connected ? '#00ff88' : '#ff3344',
             boxShadow: connected ? '0 0 8px #00ff8899' : '0 0 8px #ff334499' }} />
           <span style={desk.statusText}>{connected ? 'CONNECTED' : 'OFFLINE'}</span>
           {localFps > 0 && (
@@ -365,7 +311,6 @@ export default function App() {
       </div>
 
       <div style={desk.body}>
-        {/* Camera */}
         <div style={desk.cameraWrap}>
           <canvas ref={canvasRef} style={desk.canvas} />
           {!streamActive && (
@@ -383,7 +328,6 @@ export default function App() {
           ))}
         </div>
 
-        {/* Panel */}
         <div style={desk.panel}>
           <ModeSelector modes={MODES} current={mode} onChange={handleModeChange} />
           <div style={{ ...desk.divider, borderColor: `${modeColor}33` }} />
@@ -406,12 +350,11 @@ export default function App() {
   )
 }
 
-// ── Pure helpers ──────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
 function countFingers(lm, handedness) {
   if (!lm || lm.length < 21) return 0
   let count = 0
-  // Thumb (note: x is already in normal coords, mediapipe doesn't mirror)
   if (handedness === 'Right') { if (lm[4].x < lm[2].x - 0.04) count++ }
   else                        { if (lm[4].x > lm[2].x + 0.04) count++ }
   for (const [tip, pip] of [[8,6],[12,10],[16,14],[20,18]])
@@ -425,40 +368,37 @@ function recognizeGesture(n) {
 
 function detectSpecial(lm) {
   if (!lm) return null
-  const d = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y)
-  if (d < 0.04) return 'OK Sign'
+  if (Math.hypot(lm[4].x-lm[8].x, lm[4].y-lm[8].y) < 0.04) return 'OK Sign'
   if (lm[8].y < lm[6].y && lm[12].y < lm[10].y && lm[16].y > lm[14].y) return 'Peace Sign'
   return null
 }
 
 function getCenter(lm, w, h) {
   if (!lm?.length) return [0, 0]
-  // Mirror the x coordinate for display
-  return [Math.round((1 - (lm[0].x + lm[9].x) / 2) * w), Math.round((lm[0].y + lm[9].y) / 2 * h)]
+  return [Math.round((1-(lm[0].x+lm[9].x)/2)*w), Math.round((lm[0].y+lm[9].y)/2*h)]
 }
 
 function drawLandmarksMirrored(ctx, allLandmarks, w, h) {
-  const CONNECTIONS = [
+  const CONN = [
     [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
     [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
     [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17],
   ]
   for (const lm of allLandmarks) {
-    // Mirror x: (1 - x) * w
-    const pts = lm.map(l => [(1 - l.x) * w, l.y * h])
+    const pts = lm.map(l => [(1-l.x)*w, l.y*h])
     ctx.strokeStyle = '#00c864'; ctx.lineWidth = 2
-    for (const [a, b] of CONNECTIONS) {
+    for (const [a,b] of CONN) {
       ctx.beginPath(); ctx.moveTo(...pts[a]); ctx.lineTo(...pts[b]); ctx.stroke()
     }
-    for (const [x, y] of pts) {
-      ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2)
-      ctx.fillStyle = '#fff'; ctx.fill()
-      ctx.strokeStyle = '#00c864'; ctx.lineWidth = 1.5; ctx.stroke()
+    for (const [x,y] of pts) {
+      ctx.beginPath(); ctx.arc(x,y,4,0,Math.PI*2)
+      ctx.fillStyle='#fff'; ctx.fill()
+      ctx.strokeStyle='#00c864'; ctx.lineWidth=1.5; ctx.stroke()
     }
   }
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
+// ── Styles ─────────────────────────────────────────────────────────────────────
 
 const desk = {
   app: { height:'100vh', display:'flex', flexDirection:'column', background:'#0a0a0f',
